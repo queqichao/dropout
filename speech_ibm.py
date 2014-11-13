@@ -12,9 +12,8 @@ from theano.ifelse import ifelse
 import theano.printing
 import theano.tensor.shared_randomstreams
 
-from logistic_sgd import LogisticRegression
-from load_data import load_umontreal_data, load_mnist
-
+from multioutput_logistic_sgd import MultiOutputLogisticRegression
+from load_data import load_umontreal_data, load_mnist, load_speech
 
 ##################################
 ## Various activation functions ##
@@ -138,13 +137,13 @@ class MLP(object):
         
         # Set up the output layer
         n_in, n_out = weight_matrix_sizes[-1]
-        dropout_output_layer = LogisticRegression(
+        dropout_output_layer = MultiOutputLogisticRegression(
                 input=next_dropout_layer_input,
                 n_in=n_in, n_out=n_out)
         self.dropout_layers.append(dropout_output_layer)
 
         # Again, reuse paramters in the dropout output.
-        output_layer = LogisticRegression(
+        output_layer = MultiOutputLogisticRegression(
             input=next_layer_input,
             # scale the weight matrix W with (1-p)
             W=dropout_output_layer.W * (1 - dropout_rates[-1]),
@@ -154,11 +153,12 @@ class MLP(object):
 
         # Use the negative log likelihood of the logistic regression layer as
         # the objective.
-        self.dropout_negative_log_likelihood = self.dropout_layers[-1].negative_log_likelihood
+        self.dropout_least_square_loss = self.dropout_layers[-1].least_square_loss
         self.dropout_errors = self.dropout_layers[-1].errors
 
-        self.negative_log_likelihood = self.layers[-1].negative_log_likelihood
+        self.least_square_loss = self.layers[-1].least_square_loss
         self.errors = self.layers[-1].errors
+        self.evaluate_hitfa = self.layers[-1].evaluate_hitfa
 
         # Grab all the parameters together.
         self.params = [ param for layer in self.dropout_layers for param in layer.params ]
@@ -190,13 +190,14 @@ def test_mlp(
 
     """
     assert len(layer_sizes) - 1 == len(dropout_rates)
-    
+
     # extract the params for momentum
     mom_start = mom_params["start"]
     mom_end = mom_params["end"]
     mom_epoch_interval = mom_params["interval"]
     
-    datasets = load_umontreal_data(dataset)
+    
+    datasets = load_speech(dataset, channel_idx=np.array([51]))
     train_set_x, train_set_y = datasets[0]
     valid_set_x, valid_set_y = datasets[1]
     test_set_x, test_set_y = datasets[2]
@@ -216,7 +217,7 @@ def test_mlp(
     index = T.lscalar()    # index to a [mini]batch
     epoch = T.scalar()
     x = T.matrix('x')  # the data is presented as rasterized images
-    y = T.ivector('y')  # the labels are presented as 1D vector of
+    y = T.imatrix('y')  # the labels are presented as 1D vector of
                         # [int] labels
     learning_rate = theano.shared(np.asarray(initial_learning_rate,
         dtype=theano.config.floatX))
@@ -231,8 +232,31 @@ def test_mlp(
                      use_bias=use_bias)
 
     # Build the expresson for the cost function.
-    cost = classifier.negative_log_likelihood(y)
-    dropout_cost = classifier.dropout_negative_log_likelihood(y)
+    cost = classifier.least_square_loss(y)
+    dropout_cost = classifier.dropout_least_square_loss(y)
+
+    eval_valid_cost = theano.function(inputs=[],
+            outputs=classifier.least_square_loss(y),
+            givens={
+                x: valid_set_x,
+                y: valid_set_y})
+
+    # Compile theano function for testing.
+    eval_test_hitfa = theano.function(inputs=[],
+            outputs=classifier.evaluate_hitfa(y),
+            givens={
+                x: test_set_x,
+                y: test_set_y})
+    #theano.printing.pydotprint(test_model, outfile="test_file.png",
+    #        var_with_name_simple=True)
+
+    # Compile theano function for validation.
+    eval_valid_hitfa = theano.function(inputs=[],
+            outputs=classifier.evaluate_hitfa(y),
+            givens={
+                x: valid_set_x,
+                y: valid_set_y})
+
 
     # Compile theano function for testing.
     test_model = theano.function(inputs=[index],
@@ -323,22 +347,18 @@ def test_mlp(
     # training function because we only want to do this once each epoch instead
     # of after each minibatch.
     decay_learning_rate = theano.function(inputs=[], outputs=learning_rate,
-            updates={learning_rate: learning_rate * learning_rate_decay})
+            updates={learning_rate: learning_rate - learning_rate_decay})
 
     ###############
     # TRAIN MODEL #
     ###############
     print '... training'
 
-    # early-stopping parameters
-    patience = 10000  # look as this many examples regardless
-    patience_increase = 2  # wait this much longer when a new best is
-                           # found
-    improvement_threshold = 0.995  # a relative improvement of this much is
-                                   # considered significant
-
+    patience = 10000
+    patience_increase = 2
+    improvement_threshold = 1.005
     best_params = None
-    best_validation_errors = np.inf
+    best_validation_hitfa = 0
     best_iter = 0
     test_score = 0.
     epoch_counter = 0
@@ -346,9 +366,7 @@ def test_mlp(
 
     results_file = open(results_file_name, 'wb')
 
-    done_looping = False
-
-    while epoch_counter < n_epochs and (not done_looping):
+    while epoch_counter < n_epochs:
         # Train this epoch
         epoch_counter = epoch_counter + 1
         for minibatch_index in xrange(n_train_batches):
@@ -356,33 +374,32 @@ def test_mlp(
 
         # Compute loss on validation set
         validation_losses = [validate_model(i) for i in xrange(n_valid_batches)]
-        this_validation_errors = np.mean(validation_losses)
+        this_validation_hitfa = eval_valid_hitfa()
+        this_validation_cost = eval_valid_cost()
 
         # Report and save progress.
-        print "epoch {}, test error {}, learning_rate={}{}".format(
-                epoch_counter, this_validation_errors,
+        print "epoch {}, valid hitfa {}, cost {}, learning_rate={}{}".format(
+                epoch_counter, this_validation_hitfa, this_validation_cost,
                 learning_rate.get_value(borrow=True),
-                " **" if this_validation_errors < best_validation_errors else "")
+                " **" if this_validation_hitfa[3] > best_validation_hitfa else "")
 
-        if this_validation_errors < best_validation_errors:
-            if this_validation_errors < best_validation_errors * improvement_threshold:
+        if this_validation_hitfa[3] > best_validation_hitfa:
+            if this_validation_hitfa[3] > best_validation_hitfa * improvement_threshold:
                 patience = max(patience, epoch_counter * patience_increase)
             best_iter = epoch_counter
-            test_errors = [test_model(i) for i in xrange(n_test_batches)] 
-            test_score = np.mean(test_errors)
-            print("test score: %f %%" % test_score)
+            test_score = eval_test_hitfa()
+            print("test score: {0} %%".format(test_score))
 
-        best_validation_errors = min(best_validation_errors,
-                this_validation_errors)
-        results_file.write("{0}\n".format(this_validation_errors))
+        best_validation_hitfa = max(best_validation_hitfa,
+                this_validation_hitfa[3])
+        results_file.write("{0}\n".format(this_validation_hitfa))
         results_file.flush()
 
         new_learning_rate = decay_learning_rate()
-        
+
     end_time = time.clock()
-    print(('Optimization complete. Best validation score of %f %% '
-           'obtained at iteration %i, with test performance %f %%') %
-          (best_validation_errors * 100., best_iter, test_score * 100.))
+    print(('Optimization complete. Best validation score of {0} %% '
+           'obtained at iteration %i, with test performance {1} %%').format(best_validation_hitfa * 100., best_iter, test_score * 100.))
     print >> sys.stderr, ('The code for file ' +
                           os.path.split(__file__)[1] +
                           ' ran for %.2fm' % ((end_time - start_time) / 60.))
@@ -396,31 +413,32 @@ if __name__ == '__main__':
     # and generating the dropout masks for each mini-batch
     random_seed = 1234
 
-    initial_learning_rate = 1.0
+    initial_learning_rate = 2.0
     learning_rate_decay = 0.998
     squared_filter_length_limit = 15.0
-    n_epochs = 50
-    batch_size = 100
-    layer_sizes = [ 28*28, 1200, 1200, 10 ]
+    n_epochs = 100
+    learning_rate_linear_decay = 0.999 / n_epochs
+    batch_size = 1024
+    layer_sizes = [ 425, 2048, 2048, 1 ]
     
     # dropout rate for each layer
     dropout_rates = [ 0.2, 0.5, 0.5 ]
     # activation functions for each layer
     # For this demo, we don't need to set the activation functions for the 
     # on top layer, since it is always 10-way Softmax
-    activations = [ ReLU, ReLU ]
+    activations = [ ReLU, ReLU]
     
     #### the params for momentum
     mom_start = 0.5
-    mom_end = 0.99
+    mom_end = 0.9
     # for epoch in [0, mom_epoch_interval], the momentum increases linearly
     # from mom_start to mom_end. After mom_epoch_interval, it stay at mom_end
-    mom_epoch_interval = 500
+    mom_epoch_interval = 5
     mom_params = {"start": mom_start,
                   "end": mom_end,
                   "interval": mom_epoch_interval}
                   
-    dataset = 'data/mnist.pkl.gz'
+    dataset = 'data/mnist_batches.npz'
     #dataset = 'data/mnist.pkl.gz'
 
     if len(sys.argv) < 2:
@@ -440,7 +458,7 @@ if __name__ == '__main__':
         exit(1)
 
     test_mlp(initial_learning_rate=initial_learning_rate,
-             learning_rate_decay=learning_rate_decay,
+             learning_rate_decay=learning_rate_linear_decay,
              squared_filter_length_limit=squared_filter_length_limit,
              n_epochs=n_epochs,
              batch_size=batch_size,

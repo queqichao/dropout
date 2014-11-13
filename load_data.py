@@ -1,4 +1,5 @@
 import numpy as np
+import scipy.io
 import cPickle
 import gzip
 import os
@@ -6,6 +7,17 @@ import sys
 
 import theano
 import theano.tensor as T
+
+def min_max_normalize(X):
+    min_x = np.min(X, axis=0)
+    max_x = np.max(X, axis=0)
+    return np.divide(X - min_x, max_x - min_x)
+
+def mean_and_std(X):
+  return np.mean(X, axis=0), np.std(X, axis=0)
+
+def mean_sub_and_std_norm(X, mean, std):
+  return np.divide(X - mean, std)
 
 def _shared_dataset(data_xy):
     """ Function that loads the dataset into shared variables
@@ -45,6 +57,39 @@ def load_mnist(path):
             (test_set_x, test_set_y)]
     return rval
 
+def load_speech(path, channel_idx=None):
+    M = scipy.io.loadmat('../contest/contest_data7.mat')
+    train_x = M['train_x']
+    train_y = M['train_y']
+    dev_x = M['dev_x']
+    dev_y = M['dev_y']
+    train_mean, train_std = mean_and_std(train_x)
+    train_x = mean_sub_and_std_norm(train_x, train_mean, train_std)
+    dev_x = mean_sub_and_std_norm(dev_x, train_mean, train_std)
+    num_training = train_x.shape[0]
+    num_dev = dev_x.shape[0]
+    p_training = np.random.permutation(num_training)
+    p_dev = np.random.permutation(num_dev)
+
+    if channel_idx is not None:
+      train_y = train_y[:, channel_idx]
+      dev_y = dev_y[:, channel_idx]
+
+    train_x, train_y = _shared_dataset((train_x[p_training], train_y[p_training]))
+    dev_x, dev_y = _shared_dataset((dev_x[p_dev], dev_y[p_dev]))
+    M = scipy.io.loadmat('../contest/contest_data_test_425d.mat')
+    test_x = M['test_x']
+    test_y = M['test_y']
+    test_x = mean_sub_and_std_norm(test_x, train_mean, train_std)
+    print(test_x)
+    num_testing = test_x.shape[0]
+    p_testing = np.random.permutation(num_testing)
+
+    if channel_idx is not None:
+      test_y = test_y[:, channel_idx]
+
+    test_x, test_y = _shared_dataset((test_x[p_testing], test_y[p_testing]))
+    return [(train_x, train_y), (dev_x, dev_y), (test_x, test_y)]
 
 def load_umontreal_data(dataset):
     ''' Loads the dataset
